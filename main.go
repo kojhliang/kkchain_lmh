@@ -24,9 +24,9 @@ func main() {
 	seconds := time.Duration(*sec)
 
 	peerPort := "9999"
-	if *port == "9999" {
-		peerPort = "9998"
-	}
+	// if *port == "9999" {
+	// 	peerPort = "9998"
+	// }
 
 	node := &impl.Node{
 		"127.0.0.1",
@@ -41,5 +41,7 @@ func main() {
 		fmt.Println("failed to start server:", err)
 	}
 
+	ch := make(chan int)
+	<-ch
 	time.Sleep(time.Second * seconds)
 }
