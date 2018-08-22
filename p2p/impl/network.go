@@ -1,19 +1,13 @@
 package impl
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net"
 	"sync"
 
-	"time"
-
-	"strings"
-
-	"encoding/hex"
-
 	"github.com/gogo/protobuf/types"
 	"github.com/invin/kkchain/crypto"
-	"github.com/invin/kkchain/crypto/ed25519"
 	"github.com/invin/kkchain/p2p"
 	"github.com/invin/kkchain/p2p/chain"
 	"github.com/invin/kkchain/p2p/dht"
@@ -28,37 +22,26 @@ var (
 	log              = logrus.New()
 )
 
-const (
-	defaultDialTimeout = 15 * time.Second
-	defaultDBPath      = "./nodedb"
-)
-
-type connFlag int
-
-const (
-	outboundConn connFlag = iota
-	inboundConn
-)
-
 // Network represents the whole stack of p2p communication between peers
 type Network struct {
 	conf p2p.Config
 	host p2p.Host
 	// Node's keypair.
 	keys *crypto.KeyPair
-
-	dht            *dht.DHT
-	BootstrapNodes []*Node
+	dht  *dht.DHT
+	//BootstrapNodes []*Node
+	BootstrapNodes []string
 	listenAddr     string
 	running        bool
+	connChan       chan p2p.Conn
 	quit           chan struct{}
 	lock           sync.Mutex
 	loopWG         sync.WaitGroup
 }
 
 // NewNetwork creates a new Network instance with the specified configuration
-func NewNetwork(address string, conf p2p.Config) *Network {
-	keys := ed25519.RandomKeyPair()
+func NewNetwork(privateKeyPath, address string, conf p2p.Config) *Network {
+	keys, _ := p2p.LoadNodeKeyFromFileOrCreateNew(privateKeyPath)
 	id := p2p.CreateID(address, keys.PublicKey)
 
 	return &Network{
@@ -66,29 +49,13 @@ func NewNetwork(address string, conf p2p.Config) *Network {
 		host:       NewHost(id),
 		keys:       keys,
 		listenAddr: address,
+		connChan:   make(chan p2p.Conn),
+		quit:       make(chan struct{}),
 	}
 }
 
-func (n *Network) Self() *Node {
-	n.lock.Lock()
-	defer n.lock.Unlock()
-	if !n.running {
-		return nil
-	}
-	return n.makeSelf(n.listenAddr)
-}
-
-func (n *Network) makeSelf(listenAddr string) *Node {
-	pubkey := n.keys.PublicKey
-	if listenAddr == "" {
-		return &Node{IP: "0.0.0.0", ID: p2p.CreateID("0.0.0.0", pubkey)}
-	}
-	addr := strings.Split(listenAddr, ":")
-	return &Node{
-		ID:      p2p.CreateID(listenAddr, pubkey),
-		IP:      addr[0],
-		TCPPort: addr[1],
-	}
+func (n *Network) GetConnChan() *chan p2p.Conn {
+	return &n.connChan
 }
 
 // Start kicks off the p2p stack
@@ -106,8 +73,6 @@ func (n *Network) Start() error {
 		return fmt.Errorf("Server.PrivateKey must be set to a non-nil key")
 	}
 
-	n.quit = make(chan struct{})
-
 	// init handshake msg handler
 	handshake.NewHandshake(n.host)
 	// init chain msg handler
@@ -123,6 +88,7 @@ func (n *Network) Start() error {
 		select {
 		case <-n.quit:
 			n.dht.Stop()
+			n.host.RemoveAllConnection()
 		}
 	}()
 
@@ -137,11 +103,12 @@ func (n *Network) Start() error {
 		log.Warn("P2P server will be useless, not listening")
 	}
 
-	n.loopWG.Add(1)
-
 	// dail
+	n.loopWG.Add(1)
 	go n.run()
-	n.running = true
+
+	n.loopWG.Add(1)
+	go n.RecvMessage()
 
 	return nil
 }
@@ -149,6 +116,10 @@ func (n *Network) Start() error {
 // Conf gets configurations
 func (n *Network) Conf() p2p.Config {
 	return n.conf
+}
+
+func (n *Network) Bootstraps() []string {
+	return n.BootstrapNodes
 }
 
 // Stop stops the p2p stack
@@ -164,169 +135,119 @@ func (n *Network) Stop() {
 }
 
 func (n *Network) startListening() error {
-	listener, err := net.Listen("tcp", n.listenAddr)
+	addr, err := dht.ToNetAddr(n.listenAddr)
+	if err != nil {
+		return err
+	}
+
+	listener, err := net.Listen(addr.Network(), addr.String())
 	if err != nil {
 		return err
 	}
 	laddr := listener.Addr().(*net.TCPAddr)
 	n.listenAddr = laddr.String()
 	n.loopWG.Add(1)
-	go n.listenLoop(listener)
+	go n.Accept(listener)
 	return nil
 }
 
 func (n *Network) run() {
 	defer n.loopWG.Done()
 
-	for {
-
-		// connect boostnode
-		for _, node := range n.BootstrapNodes {
-			conn, _ := n.host.GetConnection(node.ID)
-			if conn != nil {
-				continue
-			}
-			go func() {
-				fd, err := n.host.Connect(node.Addr())
+	// connect boostnode
+	for _, node := range n.BootstrapNodes {
+		peer, err := dht.ParsePeerAddr(node)
+		if err != nil {
+			continue
+		}
+		conn, _ := n.host.GetConnection(peer.ID)
+		if conn != nil {
+			continue
+		}
+		go func() {
+			conn, err := n.host.Connect(peer.Address, n)
+			if err != nil {
+				log.WithFields(logrus.Fields{
+					"address": peer.Address,
+					"nodeID":  hex.EncodeToString(peer.ID.PublicKey),
+				}).Error("failed to connect boost node")
+			} else {
+				log.WithFields(logrus.Fields{
+					"address": peer.Address,
+					"nodeID":  hex.EncodeToString(peer.ID.PublicKey),
+				}).Info("success to connect boost node")
+				msg := handshake.NewMessage(handshake.Message_HELLO)
+				handshake.BuildHandshake(msg)
+				stream, err := n.CreateStream(conn, "/kkchain/p2p/handshake/1.0.0")
 				if err != nil {
-					log.WithFields(logrus.Fields{
-						"address": node.Addr(),
-						"nodeID":  hex.EncodeToString(node.ID.PublicKey),
-					}).Error("failed to connect boost node")
+					log.Error(err)
 				} else {
-					log.WithFields(logrus.Fields{
-						"address": node.Addr(),
-						"nodeID":  hex.EncodeToString(node.ID.PublicKey),
-					}).Info("success to connect boost node")
-					msg := handshake.NewMessage(handshake.Message_HELLO)
-					handshake.BuildHandshake(msg)
-					conn, err = n.CreateConnection(fd)
+					err := stream.Write(msg)
 					if err != nil {
 						log.Error(err)
-					} else {
-						stream, err := n.CreateStream(conn, "/kkchain/p2p/handshake/1.0.0")
-						if err != nil {
-							log.Error(err)
-						} else {
-							err := stream.Write(msg)
-							if err != nil {
-								log.Error(err)
-							}
-						}
 					}
+					n.host.AddConnection(peer.ID, conn)
+					n.connChan <- conn
 				}
-			}()
-		}
-		select {
-		case <-n.quit:
-			break
-		}
+			}
+		}()
 	}
-
-	n.host.RemoveAllConnection()
 }
 
-func (n *Network) listenLoop(listener net.Listener) {
+// Accept connection
+// FIXME: reference implementation
+func (n *Network) Accept(listener net.Listener) {
 	defer n.loopWG.Done()
+	n.lock.Lock()
+	running := n.running
+	n.lock.Unlock()
+	if !running {
+		log.Error(errServerStopped)
+		return
+	}
+
 	for {
 		var (
 			fd  net.Conn
 			err error
 		)
-		for {
-			fd, err = listener.Accept()
-			if err != nil {
-				log.Error("failed to accept:", err)
-				return
-			}
+
+		fd, err = listener.Accept()
+		if err != nil {
+			log.Error("failed to listen:", err)
 			break
 		}
-		go func() {
-			n.SetupConn(fd, inboundConn, nil)
-		}()
-	}
-}
-
-// create connection
-func (n *Network) SetupConn(fd net.Conn, flag connFlag, dialDest *Node) error {
-	self := n.Self()
-	if self == nil {
-		return errors.New("shutdown")
-	}
-	err := n.setupConn(fd, flag, dialDest)
-	if err != nil {
-		log.WithFields(logrus.Fields{
-			"address": fd.RemoteAddr().String(),
-			"error":   err,
-		}).Error("failed to set up connection")
-		return err
-	}
-	return nil
-}
-
-func (n *Network) setupConn(fd net.Conn, flag connFlag, dialDest *Node) error {
-	n.lock.Lock()
-	running := n.running
-	n.lock.Unlock()
-	if !running {
-		return errServerStopped
-	}
-
-	if flag == inboundConn {
+		fmt.Println("listener accepted...")
 		conn := NewConnection(fd, n, n.host)
 		if conn == nil {
-			return failedNewConnection
+			log.Error(failedNewConnection)
+			continue
 		}
 
-		err := n.Accept(conn)
-		if err != nil {
-			return err
-		}
-
-		existConn, err := n.host.GetConnection(conn.remotePeer)
-		if err != nil {
-			return err
-		}
-		if conn == existConn {
-
-			// when success to accept conn,notify dht the remote peer ID
-			n.dht.GetRecvchan() <- conn.remotePeer
-			log.WithFields(logrus.Fields{
-				"addr":      fd.RemoteAddr().String(),
-				"conn_flag": "inbound",
-			}).Info("accept connection")
-		}
-	} else {
-
-		// outbound conn
-
+		n.connChan <- conn
 	}
-	return nil
 }
 
-// Accept connection
-// FIXME: reference implementation
-func (n *Network) Accept(conn p2p.Conn) error {
-	defer func() {
-		if conn != nil {
-			conn.Close()
+func (n *Network) RecvMessage() {
+	defer n.loopWG.Done()
+	for {
+		select {
+		case conn := <-n.connChan:
+			go func() {
+				for {
+					msg, err := conn.ReadMessage()
+					if err != nil {
+						continue
+					}
+					fmt.Println("\n接受的消息：", msg.Sender, msg.Message.TypeUrl, "\n")
+					err = n.dispatchMessage(conn, msg)
+					if err != nil {
+						continue
+					}
+				}
+			}()
 		}
-	}()
-
-	msg, err := conn.ReadMessage()
-	if err != nil {
-		log.Error(err)
-		return err
 	}
-
-	err = n.dispatchMessage(conn, msg)
-
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-
-	return nil
 }
 
 // dispatch message according to protocol

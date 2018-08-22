@@ -5,43 +5,64 @@ import (
 	"fmt"
 	"time"
 
+	"encoding/hex"
+
+	"github.com/invin/kkchain/config"
+	"github.com/invin/kkchain/klogging"
+	"github.com/op/go-logging"
+
 	"github.com/invin/kkchain/crypto/blake2b"
 	"github.com/invin/kkchain/crypto/ed25519"
 	"github.com/invin/kkchain/p2p"
 	"github.com/invin/kkchain/p2p/impl"
 )
 
+var mainLogger = logging.MustGetLogger("main")
+
+// init config and loggingLoger
+func Init() {
+	config.InitConfig("")
+	klogging.Init()
+	// mainLogger.Debugf("debug %s", "secret")
+	// mainLogger.Info("info")
+	// mainLogger.Notice("notice")
+	// mainLogger.Warning("warning")
+	// mainLogger.Error("err")
+	// mainLogger.Critical("crit")
+}
+
 func main() {
-	port := flag.String("p", "9999", "")
-	sec := flag.Int("s", 60, "")
+	port := flag.String("p", "9998", "")
+	sec := flag.Int("s", 120, "")
+	keypath := flag.String("k", "", "")
 	flag.Parse()
+
+	Init()
 
 	config := p2p.Config{
 		SignaturePolicy: ed25519.New(),
 		HashPolicy:      blake2b.New(),
 	}
-	net := impl.NewNetwork("127.0.0.1:"+*port, config)
+
+	listen := "/ip4/127.0.0.1/tcp/" + *port
+
+	net := impl.NewNetwork(*keypath, listen, config)
 	seconds := time.Duration(*sec)
 
-	peerPort := "9999"
-	// if *port == "9999" {
-	// 	peerPort = "9998"
-	// }
-
-	node := &impl.Node{
-		"127.0.0.1",
-		peerPort,
-		p2p.ID{},
+	if *port != "9998" {
+		remoteKeyPath := "node1.key"
+		pri, _ := p2p.LoadNodeKeyFromFile(remoteKeyPath)
+		pub, _ := ed25519.New().PrivateToPublic(pri)
+		node := "/ip4/127.0.0.1/tcp/9998"
+		node = hex.EncodeToString(pub) + "@" + node
+		fmt.Printf("remote peer: %s\n", node)
+		net.BootstrapNodes = []string{node}
 	}
-
-	net.BootstrapNodes = []*impl.Node{node}
 
 	err := net.Start()
 	if err != nil {
-		fmt.Println("failed to start server:", err)
+		fmt.Printf("failed to start server: %s\n", err)
 	}
 
-	ch := make(chan int)
-	<-ch
 	time.Sleep(time.Second * seconds)
 }

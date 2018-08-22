@@ -14,7 +14,6 @@ func testConfig() *dht.DHTConfig {
 	return &dht.DHTConfig{
 		BucketSize:      16,
 		RoutingTableDir: "/Users/walker/Work/dht.db",
-		BootstrapNodes:  []string{},
 	}
 }
 
@@ -37,7 +36,7 @@ func main() {
 
 	host := impl.NewHost(peerA.ID)
 
-	kad := dht.NewDHT(testConfig(), host)
+	kad := dht.NewDHT(testConfig(), nil, host)
 
 	for i := 0; i < 1; i++ {
 		//key, _ = p2p.GenerateKey(libcrypto.Secp256k1)
